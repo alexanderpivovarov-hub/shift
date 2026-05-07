@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shift – социальная сеть</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: system-ui, -apple-system, 'Inter', sans-serif; }
+    body { background: #0f0f12; color: #e4e4e7; padding: 20px; }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .card { background: #18181b; border-radius: 24px; padding: 20px; margin-bottom: 20px; }
+    .post { background: #18181b; border-radius: 24px; padding: 20px; margin-bottom: 16px; }
+    .avatar { width: 48px; height: 48px; border-radius: 50%; object-fit: cover; background: #3f3f46; }
+    .flex { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+    .gap-2 { gap: 8px; }
+    .between { justify-content: space-between; }
+    .col { flex-direction: column; }
+    button, .button { background: #3b82f6; border: none; padding: 8px 20px; border-radius: 40px; color: white; cursor: pointer; font-weight: 500; }
+    button.danger { background: #dc2626; }
+    input, textarea { background: #27272a; border: 1px solid #3f3f46; border-radius: 16px; padding: 10px 14px; color: white; width: 100%; }
+    .text-muted { color: #a1a1aa; font-size: 14px; }
+    .mb-2 { margin-bottom: 12px; }
+    .mt-2 { margin-top: 12px; }
+    .w-full { width: 100%; }
+    .grid-2 { display: grid; grid-template-columns: 1fr 2fr; gap: 20px; }
+    .sidebar { background: #18181b; border-radius: 24px; padding: 20px; height: fit-content; }
+    @media (max-width: 700px) { .grid-2 { grid-template-columns: 1fr; } }
+  </style>
+</head>
+<body>
+<div class="container" id="app"></div>
+
+<script>
+  let token = localStorage.getItem('token');
+  let socket = null;
+  let currentUser = null;
+  let currentView = 'feed';
+
+  async function api(method, url, data, isFormData = false) {
+    const headers = !isFormData ? { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` } : { 'Authorization': `Bearer ${token}` };
+    const body = isFormData ? data : (data ? JSON.stringify(data) : undefined);
+    const res = await fetch(url, { method, headers, body });
+    return res.json();
+  }
+
+  function initSocket() {
+    if (!token) return;
+    socket = io({ auth: { token } });
+    socket.on('private_message', (msg) => {
+      if (currentView === 'messages') renderMessages();
+    });
+  }
+
+  // --- UI ---
+  async function renderFeed() {
+    const posts = await api('GET', '/api/feed');
+    let html = `
+      <div class="card">
+        <textarea id="postText" rows="3" placeholder="Что нового?"></textarea>
+        <input type="file" id="postMedia" accept="image/*">
+        <button id="publishBtn" class="mt-2">📤 Опубликовать</button>
+      </div>
+    `;
+    for (let p of posts) {
+      html += `
+        <div class="post">
+          <div class="flex">
+            <img class="avatar" src="https://randomuser.me/api/portraits/lego/1.jpg" onerror="this.src='https://via.placeholder.com/48'">
+            <div><b>${escapeHtml(p.name)}</b> <span class="text-muted">@${escapeHtml(p.username)}</span></div>
+          </div>
+          <p class="mt-2">${escapeHtml(p.text)}</p>
+          ${p.media ? `<img src="${p.media}" class="mt-2" style="max-width:100%; border-radius:20px;">` : ''}
+          <div class="flex text-muted mt-2">❤️ ${p.likes || 0}  💬 0</div>
+        </div>
+      `;
+    }
+    document.getElementById('app').innerHTML = html;
+    document.getElementById('publishBtn')?.addEventListener('click', async () => {
+      const text = document.getElementById('postText').value;
+      const file = document.getElementById('postMedia').files[0];
+      const fd = new FormData();
+      fd.append('text', text);
+      if (file) fd.append('media', file);
+      await fetch('/api/posts', { method: 'POST', headers: { 'Authorization': `Bearer ${token}` }, body: fd });
+      renderFeed();
+    });
+  }
+
+  async function renderMessages() {
+    const contacts = await api('GET', '/api/contacts');
+    let html = `<div class="grid-2"><div class="sidebar"><h3>📨 Контакты</h3>`;
+    for (let c of contacts) {
+      html += `<div class="card" style="cursor:pointer; margin-bottom:8px" onclick="window.selectContact(${c.id})">${escapeHtml(c.name)} (@${escapeHtml(c.username)})</div>`;
+    }
+    html += `</div><div class="card" id="chatPanel">Выберите контакт</div></div>`;
+    document.getElementById('app').innerHTML = html;
+    window.selectContact = async (id) => {
+      const msgs = await api('GET', `/api/messages/${id}`);
+      let chatHtml = `<div id="chatMsgs" style="height:300px; overflow-y:auto; margin-bottom:12px">`;
+      msgs.forEach(m => {
+        chatHtml += `<div><b>${m.fromId === currentUser.id ? 'Вы' : 'Собеседник'}</b>: ${escapeHtml(m.text)}</div>`;
+      });
+      chatHtml += `</div><div class="flex"><input id="msgText" placeholder="Сообщение..." class="w-full"><button id="sendMsg">➤</button></div>`;
+      document.getElementById('chatPanel').innerHTML = chatHtml;
+      document.getElementById('sendMsg').onclick = () => {
+        const text = document.getElementById('msgText').value;
+        if (text.trim()) socket.emit('private_message', { to: id, text });
+        document.getElementById('msgText').value = '';
+      };
+    };
+  }
+
+  async function renderAdmin() {
+    if (!currentUser?.isAdmin) return renderFeed();
+    let html = `<div class="card"><h2>🔒 Админ панель</h2><input id="adminSearch" placeholder="Поиск по имени / username..."><div id="adminResults"></div>
+    <button id="subPlusBtn" class="mt-2">Выдать подписку Plus тестовому пользователю</button></div>`;
+    document.getElementById('app').innerHTML = html;
+    document.getElementById('adminSearch').addEventListener('input', async (e) => {
+      const q = e.target.value;
+      if (q.length < 2) return;
+      const users = await api('GET', `/__admin__/users?q=${q}`);
+      let resHtml = '';
+      for (let u of users) {
+        resHtml += `<div class="flex between" style="background:#27272a; border-radius:20px; padding:10px; margin-top:8px">
+          <span>${escapeHtml(u.name)} (@${escapeHtml(u.username)}) [${u.subscription}]</span>
+          <button onclick="window.giveSub(${u.id})">🎁 Дать Pro</button>
+        </div>`;
+      }
+      document.getElementById('adminResults').innerHTML = resHtml;
+    });
+    window.giveSub = async (userId) => {
+      await fetch('/__admin__/subscription', { method:'POST', headers:{'Content-Type':'application/json','Authorization':`Bearer ${token}`}, body: JSON.stringify({ userId, plan:'pro' }) });
+      alert('Подписка выдана');
+    };
+    document.getElementById('subPlusBtn').onclick = () => alert('Функция: выдача подписки через поиск выше');
+  }
+
+  function renderNav() {
+    if (!token) return '';
+    return `
+      <div class="flex between mb-3">
+        <div class="flex gap-2">
+          <button class="${currentView === 'feed' ? 'button' : ''}" id="navFeed">📰 Лента</button>
+          <button id="navMsg">💬 Чаты</button>
+          ${currentUser?.isAdmin ? '<button id="navAdmin">🔒 Админка</button>' : ''}
+        </div>
+        <button id="logoutBtn" class="danger">Выйти</button>
+      </div>
+    `;
+  }
+
+  async function renderApp() {
+    if (!token) {
+      document.getElementById('app').innerHTML = `
+        <div class="card" style="text-align:center">
+          <h1>Shift</h1>
+          <p class="text-muted">Альтернативная соцсеть без слежки</p>
+          <div class="flex" style="justify-content:center; margin-top:20px">
+            <button id="loginBtn">Вход</button>
+            <button id="regBtn">Регистрация</button>
+          </div>
+        </div>
+      `;
+      document.getElementById('loginBtn').onclick = () => { document.getElementById('app').innerHTML = `<div class="card"><input id="login" placeholder="Логин"><input id="pass" type="password" placeholder="Пароль"><button id="doLogin">Войти</button></div>`;
+        document.getElementById('doLogin').onclick = async () => {
+          const res = await fetch('/api/login', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ login: document.getElementById('login').value, password: document.getElementById('pass').value }) });
+          const data = await res.json();
+          if (data.token) { token = data.token; localStorage.setItem('token', token); currentUser = data.user; initSocket(); renderApp(); }
+          else alert('Ошибка входа');
+        };
+      };
+      document.getElementById('regBtn').onclick = () => { document.getElementById('app').innerHTML = `<div class="card"><input id="name" placeholder="Имя"><input id="username" placeholder="Username"><input id="login" placeholder="Логин"><input id="pass" type="password" placeholder="Пароль"><button id="doReg">Зарегистрироваться</button></div>`;
+        document.getElementById('doReg').onclick = async () => {
+          const res = await fetch('/api/register', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name: document.getElementById('name').value, username: document.getElementById('username').value, login: document.getElementById('login').value, password: document.getElementById('pass').value }) });
+          const data = await res.json();
+          if (data.token) { token = data.token; localStorage.setItem('token', token); currentUser = data.user; initSocket(); renderApp(); }
+          else alert('Ошибка регистрации');
+        };
+      };
+      return;
+    }
+    // Авторизован
+    document.getElementById('app').innerHTML = renderNav() + '<div id="pageContent"></div>';
+    document.getElementById('navFeed')?.addEventListener('click', () => { currentView='feed'; renderFeed(); });
+    document.getElementById('navMsg')?.addEventListener('click', () => { currentView='messages'; renderMessages(); });
+    document.getElementById('navAdmin')?.addEventListener('click', () => { currentView='admin'; renderAdmin(); });
+    document.getElementById('logoutBtn')?.addEventListener('click', () => { localStorage.removeItem('token'); token=null; renderApp(); });
+    if (currentView === 'feed') renderFeed();
+    else if (currentView === 'messages') renderMessages();
+    else if (currentView === 'admin') renderAdmin();
+    else renderFeed();
+  }
+
+  function escapeHtml(str) { if(!str) return ''; return str.replace(/[&<>]/g, function(m){ if(m==='&') return '&amp;'; if(m==='<') return '&lt;'; if(m==='>') return '&gt;'; return m;}); }
+
+  // Старт
+  if (token) {
+    fetch('/api/login', { headers:{'Authorization':`Bearer ${token}`} }).then(r=>r.json()).then(data=>{ if(data.user) { currentUser = data.user; initSocket(); renderApp(); } else { token=null; renderApp(); } }).catch(()=>{ token=null; renderApp(); });
+  } else { renderApp(); }
+</script>
+</body>
+</html>
